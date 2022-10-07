@@ -380,6 +380,10 @@ class Trainer:
 
         if self.place_model_on_device:
             self._move_model_to_device(model, args.device)
+        
+        if args.use_dtr:
+            self._use_dtr(model, args.memory_threshold - args.memory_buffer)
+            optimizers[0].__init__(model.parameters(), lr=0.1)
 
         # Force n_gpu to 1 to avoid DataParallel as MP will manage the GPUs
         if self.is_model_parallel:
@@ -505,6 +509,7 @@ class Trainer:
 
         # very last
         self._memory_tracker.stop_and_update_metrics()
+        self.max_memory = 0
 
     def add_callback(self, callback):
         """
@@ -550,12 +555,24 @@ class Trainer:
         if self.args.parallel_mode == ParallelMode.TPU and hasattr(model, "tie_weights"):
             model.tie_weights()
 
+    def _use_dtr(self, model, memory_budget):
+        print("set dtr memory budget %.2f GiM" % memory_budget)
+        torch.set_memory_budget(int(memory_budget * (1024 ** 3)))
+        model._apply(lambda v: v.detach().try_checkpoint())
+        torch.toggle_ignore_small_tensors(True)
+        torch.toggle_sampling(True)
+        # torch.toggle_log(True)
+        # torch.toggle_profile(True)
+        # torch.reset_profile()
+
     def _remove_unused_columns(self, dataset: "datasets.Dataset", description: Optional[str] = None):
         if not self.args.remove_unused_columns:
             return dataset
         if self._signature_columns is None:
             # Inspect model forward signature to keep only the arguments it accepts.
             signature = inspect.signature(self.model.forward)
+            if hasattr(self.model, "old_forward"):
+                signature = inspect.signature(self.model.old_forward)
             self._signature_columns = list(signature.parameters.keys())
             # Labels may be named label or label_ids, the default data collator handles that.
             self._signature_columns += ["label", "label_ids"]
@@ -1484,7 +1501,11 @@ class Trainer:
                         scale_after = self.scaler.get_scale()
                         optimizer_was_run = scale_before <= scale_after
                     else:
+                        # torch.cuda.synchronize()
+                        # start_time = time.time()
                         self.optimizer.step()
+                        # torch.cuda.synchronize()
+                        # print(f"update {time.time() - start_time}", flush=True)
 
                     if optimizer_was_run and not self.deepspeed:
                         self.lr_scheduler.step()
@@ -1580,6 +1601,8 @@ class Trainer:
 
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
 
+        logger.info(f"max_memory_used={self.max_memory}")
+
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
     def _load_state_dict_in_model(self, state_dict):
@@ -1612,6 +1635,8 @@ class Trainer:
 
             logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
             logs["learning_rate"] = self._get_learning_rate()
+            logs["steps"] = self.state.global_step
+            # print("\n" + str(logs) + "\n", flush=True)
 
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
@@ -2006,9 +2031,17 @@ class Trainer:
             scaler = self.scaler if self.do_grad_scaling else None
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps, scaler=scaler)
             return loss_mb.reduce_mean().detach().to(self.args.device)
+        if self.args.use_dtr:
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    inputs[k] = v.checkpoint()
 
         with self.autocast_smart_context_manager():
+            # torch.cuda.synchronize()
+            # start_time = time.time()
             loss = self.compute_loss(model, inputs)
+            # torch.cuda.synchronize()
+            # print(f"forward: {time.time() - start_time}", flush=True)
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -2024,9 +2057,25 @@ class Trainer:
                 scaled_loss.backward()
         elif self.deepspeed:
             # loss gets scaled under gradient_accumulation_steps in deepspeed
+            # torch.cuda.synchronize()
+            # start_time = time.time()
             loss = self.deepspeed.backward(loss)
+            # torch.cuda.synchronize()
+            # print(f"backward: {time.time() - start_time}", flush=True)
         else:
+            # torch.cuda.synchronize()
+            # start_time = time.time()
             loss.backward()
+            # torch.cuda.synchronize()
+            # print(f"backward: {time.time() - start_time}", flush=True)
+        if self.args.use_dtr:
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    inputs[k] = v.decheckpoint()
+            loss = loss.decheckpoint()
+            torch.clear_checkpointpool()
+
+        self.max_memory = max(self.max_memory, torch.cuda.max_memory_reserved())
 
         return loss.detach()
 
@@ -2035,7 +2084,7 @@ class Trainer:
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
         Subclass and override for custom behavior.
-        """
+        """     
         if self.label_smoother is not None and "labels" in inputs:
             labels = inputs.pop("labels")
         else:

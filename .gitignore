@@ -1,4 +1,13 @@
 # Initially taken from Github's Python gitignore file
+*.patch
+*log.train*
+*log.test*
+*.png
+*log.dataset*
+*log.loss*
+*log.predict*
+*log.*
+*.pdf*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

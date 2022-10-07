@@ -548,6 +548,7 @@ class XLNetPreTrainedModel(PreTrainedModel):
 
     config_class = XLNetConfig
     load_tf_weights = load_tf_weights_in_xlnet
+    supports_gradient_checkpointing = True
     base_model_prefix = "transformer"
 
     def _init_weights(self, module):
@@ -580,6 +581,10 @@ class XLNetPreTrainedModel(PreTrainedModel):
                 param.data.normal_(mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, XLNetModel):
             module.mask_emb.data.normal_(mean=0.0, std=self.config.initializer_range)
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, XLNetModel):
+            module.gradient_checkpointing = value
 
 
 @dataclass
@@ -953,6 +958,8 @@ class XLNetModel(XLNetPreTrainedModel):
         self.layer = nn.ModuleList([XLNetLayer(config) for _ in range(config.n_layer)])
         self.dropout = nn.Dropout(config.dropout)
 
+        self.gradient_checkpointing = False
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1243,18 +1250,40 @@ class XLNetModel(XLNetPreTrainedModel):
             if output_hidden_states:
                 hidden_states.append((output_h, output_g) if output_g is not None else output_h)
 
-            outputs = layer_module(
-                output_h,
-                output_g,
-                attn_mask_h=non_tgt_mask,
-                attn_mask_g=attn_mask,
-                r=pos_emb,
-                seg_mat=seg_mat,
-                mems=mems[i],
-                target_mapping=target_mapping,
-                head_mask=head_mask[i],
-                output_attentions=output_attentions,
-            )
+            if self.training and self.gradient_checkpointing:
+                def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs,
+                                          attn_mask_h=non_tgt_mask,
+                                          attn_mask_g=attn_mask,
+                                          r=pos_emb,
+                                          seg_mat=seg_mat,
+                                          mems=mems[i],
+                                          target_mapping=target_mapping,
+                                          head_mask=head_mask[i],
+                                          output_attentions=output_attentions
+                                          )
+
+                        return custom_forward
+    
+                outputs = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer_module),
+                    output_h,
+                    output_g,
+                )
+            else:
+                outputs = layer_module(
+                    output_h,
+                    output_g,
+                    attn_mask_h=non_tgt_mask,
+                    attn_mask_g=attn_mask,
+                    r=pos_emb,
+                    seg_mat=seg_mat,
+                    mems=mems[i],
+                    target_mapping=target_mapping,
+                    head_mask=head_mask[i],
+                    output_attentions=output_attentions,
+                )
             output_h, output_g = outputs[:2]
             if output_attentions:
                 attentions.append(outputs[2])

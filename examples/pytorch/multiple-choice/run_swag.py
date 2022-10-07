@@ -41,6 +41,7 @@ from transformers import (
     default_data_collator,
     set_seed,
 )
+from trainer import CountShape as Trainer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import PaddingStrategy, check_min_version
@@ -84,6 +85,12 @@ class ModelArguments:
         metadata={
             "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
             "with private models)."
+        },
+    )
+    use_sublinear: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use sublinear to save GPU memory."
         },
     )
 
@@ -135,6 +142,21 @@ class DataTrainingArguments:
             "value if set."
         },
     )
+    
+    dynamic_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Use Dynamic Checkpoint for train speed and gpu memory"})
+    warmup_iters: Optional[int] = field(default=30, metadata={"help": "Warmup iters for Dynamic Checkpoint"})
+    static_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Static Checkpoint"})
+    max_input_size: Optional[int] = field(default=142, metadata={"help": "Max input size of the Dataset"})
+    min_input_size: Optional[int] = field(default=32, metadata={"help": "Min input size of the Dataset"})
+
+    prev_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Use checkpoint before every opti"})
+    profile_memory: Optional[bool] = field(default=False, metadata={"help": "Get memory usage"})
+
+    only_input_size: Optional[bool] = field(default=False, metadata={"help": "Get input size distribution of the dataset"})
+
+    memory_predict_test: Optional[bool] = field(default=False, metadata={"help": "Test the accuracy of the memory prediction function"})
+    # head_checkpoint: Optional[int] = field(default=0, metadata={"help": "checkpoint first N layers"})
+    # tail_checkpoint: Optional[int] = field(default=0, metadata={"help": "checkpoint last N layers"})
 
     def __post_init__(self):
         if self.train_file is not None:
@@ -201,6 +223,18 @@ class DataCollatorForMultipleChoice:
         batch["labels"] = torch.tensor(labels, dtype=torch.int64)
         return batch
 
+def add_checkpoint(model, layer_index):
+    def cast_layer_forward(module):
+        old_forward = module.forward
+        def forward(*args, **kwargs):
+            import torch.utils.checkpoint as checkpoint
+            return checkpoint.checkpoint(old_forward, *args, **kwargs)
+        module.forward = forward
+    for index in layer_index:
+        layer = model.bert.encoder.layer[index]
+        layer.old_forward = layer.forward
+        cast_layer_forward(layer)
+
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -214,6 +248,13 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    copy_args = ["dynamic_checkpoint", "warmup_iters", "static_checkpoint", "max_input_size", "min_input_size", "profile_memory", "only_input_size"]
+    for arg in copy_args:
+        value = getattr(data_args, arg)
+        setattr(training_args, arg, value)
+    # if data_args.memory_predict_test:
+    #     from memory_trainer import MemoryPredict as Trainer
 
     # Setup logging
     logging.basicConfig(
@@ -234,6 +275,7 @@ def main():
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
+    logger.info(f"DataTraining parameters {data_args}")
 
     # Detecting last checkpoint.
     last_checkpoint = None
@@ -303,6 +345,7 @@ def main():
         use_fast=model_args.use_fast_tokenizer,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+        # return_token_type_ids=False,
     )
     model = AutoModelForMultipleChoice.from_pretrained(
         model_args.model_name_or_path,
@@ -312,6 +355,15 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    if model_args.use_sublinear:
+        model.bert.encoder.sublinear = True
+
+    if data_args.prev_checkpoint:
+        layer_index = [10, 11, 3, 0, 8, 4, 9]
+        add_checkpoint(model, layer_index)
+    # encoder_layer_number = len(model.bert.encoder.layer)
+    # add_checkpoint(model, list(range(data_args.head_checkpoint)))
+    # add_checkpoint(model, list(range(encoder_layer_number - 1, encoder_layer_number - 1 - data_args.tail_checkpoint, -1)))
 
     # When using your own dataset or a different dataset from swag, you will probably need to change this.
     ending_names = [f"ending{i}" for i in range(4)]
@@ -400,6 +452,10 @@ def main():
         preds = np.argmax(predictions, axis=1)
         return {"accuracy": (preds == label_ids).astype(np.float32).mean().item()}
 
+    # optimizer = torch.optim.AdamW(model.parameters())
+    # optimizer = torch.optim.Adam(model.parameters())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
@@ -409,6 +465,7 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        optimizers=(optimizer, scheduler),
     )
 
     # Training

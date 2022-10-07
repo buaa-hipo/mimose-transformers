@@ -533,6 +533,7 @@ class BertEncoder(nn.Module):
         self.config = config
         self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+        self.sublinear = False
 
     def forward(
         self,
@@ -552,53 +553,85 @@ class BertEncoder(nn.Module):
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
 
         next_decoder_cache = () if use_cache else None
-        for i, layer_module in enumerate(self.layer):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-
-            layer_head_mask = head_mask[i] if head_mask is not None else None
-            past_key_value = past_key_values[i] if past_key_values is not None else None
-
-            if self.gradient_checkpointing and self.training:
-
-                if use_cache:
-                    logger.warning(
-                        "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                    )
-                    use_cache = False
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs, past_key_value, output_attentions)
-
-                    return custom_forward
-
+        if self.sublinear:
+            assert encoder_hidden_states is None
+            assert encoder_attention_mask is None
+            assert past_key_values is None
+            assert not use_cache
+            assert not output_attentions
+            assert not output_hidden_states
+            
+            def run_function(layers):
+                def forward(*inputs):
+                    hidden_states = inputs[0]
+                    for layer in layers:
+                        layer_outputs = layer(
+                            hidden_states,
+                            attention_mask,
+                        )
+                        hidden_states = layer_outputs[0]
+                    return layer_outputs
+                return forward
+            
+            segments = int(math.sqrt(len(self.layer)))
+            segment_size = len(self.layer) // segments
+            end = -1
+            for start in range(0, len(self.layer), segment_size):
+                end = start + segment_size
                 layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(layer_module),
+                    run_function(self.layer[start:end]),
                     hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
                 )
-            else:
-                layer_outputs = layer_module(
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                    past_key_value,
-                    output_attentions,
-                )
+                hidden_states = layer_outputs[0]
+        else:
+            # origin
+            for i, layer_module in enumerate(self.layer):
+                if output_hidden_states:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
 
-            hidden_states = layer_outputs[0]
-            if use_cache:
-                next_decoder_cache += (layer_outputs[-1],)
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
-                if self.config.add_cross_attention:
-                    all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
+                layer_head_mask = head_mask[i] if head_mask is not None else None
+                past_key_value = past_key_values[i] if past_key_values is not None else None
+
+                if self.gradient_checkpointing and self.training:
+
+                    if use_cache:
+                        logger.warning(
+                            "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                        )
+                        use_cache = False
+
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs, past_key_value, output_attentions)
+
+                        return custom_forward
+
+                    layer_outputs = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(layer_module),
+                        hidden_states,
+                        attention_mask,
+                        layer_head_mask,
+                        encoder_hidden_states,
+                        encoder_attention_mask,
+                    )
+                else:
+                    layer_outputs = layer_module(
+                        hidden_states,
+                        attention_mask,
+                        layer_head_mask,
+                        encoder_hidden_states,
+                        encoder_attention_mask,
+                        past_key_value,
+                        output_attentions,
+                    )
+
+                hidden_states = layer_outputs[0]
+                if use_cache:
+                    next_decoder_cache += (layer_outputs[-1],)
+                if output_attentions:
+                    all_self_attentions = all_self_attentions + (layer_outputs[1],)
+                    if self.config.add_cross_attention:
+                        all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)

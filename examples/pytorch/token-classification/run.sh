@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+T=`date +%m%d%H%M`
+
 python3 run_ner.py \
   --model_name_or_path bert-base-uncased \
   --dataset_name conll2003 \
   --output_dir /tmp/test-ner \
   --do_train \
-  --do_eval
+  --do_eval \
+  --per_device_train_batch_size 64 \
+  --overwrite_output_dir | tee train_log/log.train.$T

@@ -24,11 +24,13 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
+import torch
 import datasets
 from datasets import load_dataset, load_metric
 
 import transformers
 from trainer_qa import QuestionAnsweringTrainer
+from trainer import CountShape as QuestionAnsweringTrainer
 from transformers import (
     AutoConfig,
     AutoModelForQuestionAnswering,
@@ -86,6 +88,13 @@ class ModelArguments:
         },
     )
 
+    use_sublinear: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use sublinear to save GPU memory."
+        },
+    )
+
 
 @dataclass
 class DataTrainingArguments:
@@ -115,15 +124,15 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
-    max_seq_length: int = field(
-        default=384,
+    max_seq_length: Optional[int] = field(
+        default=None,
         metadata={
             "help": "The maximum total input sequence length after tokenization. Sequences longer "
             "than this will be truncated, sequences shorter will be padded."
         },
     )
     pad_to_max_length: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "Whether to pad all samples to `max_seq_length`. "
             "If False, will pad the samples dynamically when batching to the maximum length in the batch (which can "
@@ -178,6 +187,17 @@ class DataTrainingArguments:
         },
     )
 
+    dynamic_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Use Dynamic Checkpoint for train speed and gpu memory"})
+    warmup_iters: Optional[int] = field(default=30, metadata={"help": "Warmup iters for Dynamic Checkpoint"})
+    static_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Static Checkpoint"})
+    max_input_size: Optional[int] = field(default=142, metadata={"help": "Max input size of the Dataset"})
+    min_input_size: Optional[int] = field(default=32, metadata={"help": "Min input size of the Dataset"})
+
+    prev_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Use checkpoint before every opti"})
+    profile_memory: Optional[bool] = field(default=False, metadata={"help": "Get memory usage"})
+
+    only_input_size: Optional[bool] = field(default=False, metadata={"help": "Get input size distribution of the dataset"})
+
     def __post_init__(self):
         if (
             self.dataset_name is None
@@ -210,6 +230,10 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    copy_args = ["dynamic_checkpoint", "warmup_iters", "static_checkpoint", "max_input_size", "min_input_size", "profile_memory", "only_input_size"]
+    for arg in copy_args:
+        value = getattr(data_args, arg)
+        setattr(training_args, arg, value)
 
     # Setup logging
     logging.basicConfig(
@@ -231,6 +255,7 @@ def main():
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
+    logger.info(f"DataTraining parameters {data_args}")
 
     # Detecting last checkpoint.
     last_checkpoint = None
@@ -315,6 +340,10 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    if training_args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    if model_args.use_sublinear:
+        model.bert.encoder.sublinear = True
 
     # Tokenizer check: this script requires a fast tokenizer.
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
@@ -338,6 +367,8 @@ def main():
 
     # Padding side determines if we do (question|context) or (context|question).
     pad_on_right = tokenizer.padding_side == "right"
+    if data_args.max_seq_length is None:
+        data_args.max_seq_length = tokenizer.model_max_length
 
     if data_args.max_seq_length > tokenizer.model_max_length:
         logger.warning(
@@ -578,6 +609,11 @@ def main():
 
     def compute_metrics(p: EvalPrediction):
         return metric.compute(predictions=p.predictions, references=p.label_ids)
+    
+    # optimizer = torch.optim.AdamW(model.parameters())
+    # optimizer = torch.optim.Adam(model.parameters())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
 
     # Initialize our Trainer
     trainer = QuestionAnsweringTrainer(
@@ -590,6 +626,7 @@ def main():
         data_collator=data_collator,
         post_process_function=post_processing_function,
         compute_metrics=compute_metrics,
+        optimizers=(optimizer, scheduler),
     )
 
     # Training

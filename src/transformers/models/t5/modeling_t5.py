@@ -1032,14 +1032,14 @@ class T5Stack(T5PreTrainedModel):
             else:
                 layer_outputs = layer_module(
                     hidden_states,
-                    attention_mask=extended_attention_mask,
-                    position_bias=position_bias,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=encoder_extended_attention_mask,
-                    encoder_decoder_position_bias=encoder_decoder_position_bias,
-                    layer_head_mask=layer_head_mask,
-                    cross_attn_layer_head_mask=cross_attn_layer_head_mask,
-                    past_key_value=past_key_value,
+                    extended_attention_mask,
+                    position_bias,
+                    encoder_hidden_states,
+                    encoder_extended_attention_mask,
+                    encoder_decoder_position_bias,
+                    layer_head_mask,
+                    cross_attn_layer_head_mask,
+                    past_key_value,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                 )

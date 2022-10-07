@@ -23,12 +23,14 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
+import torch
 
 import datasets
 from datasets import load_dataset, load_metric
 
 import transformers
 from trainer_qa import QuestionAnsweringTrainer
+from trainer import CountShape as QuestionAnsweringTrainer
 from transformers import (
     DataCollatorWithPadding,
     EvalPrediction,
@@ -115,14 +117,14 @@ class DataTrainingArguments:
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
     max_seq_length: int = field(
-        default=384,
+        default=512,
         metadata={
             "help": "The maximum total input sequence length after tokenization. Sequences longer "
             "than this will be truncated, sequences shorter will be padded."
         },
     )
     pad_to_max_length: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "Whether to pad all samples to `max_seq_length`. "
             "If False, will pad the samples dynamically when batching to the maximum length in the batch (which can "
@@ -177,6 +179,17 @@ class DataTrainingArguments:
         },
     )
 
+    dynamic_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Use Dynamic Checkpoint for train speed and gpu memory"})
+    warmup_iters: Optional[int] = field(default=30, metadata={"help": "Warmup iters for Dynamic Checkpoint"})
+    static_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Static Checkpoint"})
+    max_input_size: Optional[int] = field(default=142, metadata={"help": "Max input size of the Dataset"})
+    min_input_size: Optional[int] = field(default=32, metadata={"help": "Min input size of the Dataset"})
+
+    prev_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Use checkpoint before every opti"})
+    profile_memory: Optional[bool] = field(default=False, metadata={"help": "Get memory usage"})
+
+    only_input_size: Optional[bool] = field(default=False, metadata={"help": "Get input size distribution of the dataset"})
+
     def __post_init__(self):
         if (
             self.dataset_name is None
@@ -209,6 +222,10 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    copy_args = ["dynamic_checkpoint", "warmup_iters", "static_checkpoint", "max_input_size", "min_input_size", "profile_memory", "only_input_size"]
+    for arg in copy_args:
+        value = getattr(data_args, arg)
+        setattr(training_args, arg, value)
 
     # Setup logging
     logging.basicConfig(
@@ -611,6 +628,11 @@ def main():
     def compute_metrics(p: EvalPrediction):
         return metric.compute(predictions=p.predictions, references=p.label_ids)
 
+    # optimizer = torch.optim.AdamW(model.parameters())
+    # optimizer = torch.optim.Adam(model.parameters())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+
     # Initialize our Trainer
     trainer = QuestionAnsweringTrainer(
         model=model,
@@ -622,6 +644,7 @@ def main():
         data_collator=data_collator,
         post_process_function=post_processing_function,
         compute_metrics=compute_metrics,
+        optimizers=(optimizer, scheduler),
     )
 
     # Training

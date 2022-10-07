@@ -431,6 +431,10 @@ class TrainingArguments:
         },
     )
 
+    use_dtr: bool = field(default=False)
+    memory_threshold: float = field(default=28)
+    memory_buffer: float = field(default=2)
+    # profiling_memory: bool = field(default=False)
     do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
     do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
     do_predict: bool = field(default=False, metadata={"help": "Whether to run predictions on the test set."})
@@ -1021,7 +1025,7 @@ class TrainingArguments:
     @torch_required
     def _setup_devices(self) -> "torch.device":
         logger.info("PyTorch: setting up devices")
-        if torch.distributed.is_initialized() and self.local_rank == -1:
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and self.local_rank == -1:
             logger.warning(
                 "torch.distributed process group is initialized, but local_rank == -1. "
                 "In order to use Torch DDP, launch your script with `python -m torch.distributed.launch"

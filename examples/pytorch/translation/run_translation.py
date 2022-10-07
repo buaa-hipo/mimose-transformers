@@ -24,6 +24,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
+import torch
 import datasets
 import numpy as np
 from datasets import load_dataset, load_metric
@@ -45,6 +46,7 @@ from transformers import (
     default_data_collator,
     set_seed,
 )
+from trainer import CountShape as Seq2SeqTrainer
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -210,6 +212,24 @@ class DataTrainingArguments:
         },
     )
 
+    dynamic_checkpoint: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Use Dynamic Checkpoint for train speed and gpu memory"}
+    )
+    warmup_iters: Optional[int] = field(
+        default=30,
+        metadata={"help": "Warmup iters for Dynamic Checkpoint"}
+    )
+    static_checkpoint: Optional[bool] = field(
+        default=False, 
+        metadata={"help": "Static Checkpoint"}
+    )
+    max_input_size: Optional[int] = field(default=142, metadata={"help": "Max input size of the Dataset"})
+    min_input_size: Optional[int] = field(default=32, metadata={"help": "Min input size of the Dataset"})
+    profile_memory: Optional[bool] = field(default=False, metadata={"help": "Get memory usage"})
+
+    only_input_size: Optional[bool] = field(default=False, metadata={"help": "Get input size distribution of the dataset"})
+
     def __post_init__(self):
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
@@ -242,6 +262,11 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    copy_args = ["dynamic_checkpoint", "warmup_iters", "static_checkpoint", "max_input_size", "min_input_size", "profile_memory", "only_input_size"]
+    for arg in copy_args:
+        value = getattr(data_args, arg)
+        setattr(training_args, arg, value)
 
     # Setup logging
     logging.basicConfig(
@@ -424,7 +449,7 @@ def main():
 
         # Setup the tokenizer for targets
         with tokenizer.as_target_tokenizer():
-            labels = tokenizer(targets, max_length=max_target_length, padding=padding, truncation=True)
+            labels = tokenizer(targets, max_length=max_target_length, padding="max_length", truncation=True)
 
         # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
         # padding in the loss.
@@ -531,6 +556,9 @@ def main():
         result = {k: round(v, 4) for k, v in result.items()}
         return result
 
+    optimizer = torch.optim.AdamW(model.parameters())
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+
     # Initialize our Trainer
     trainer = Seq2SeqTrainer(
         model=model,
@@ -540,6 +568,7 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics if training_args.predict_with_generate else None,
+        optimizers=(optimizer, scheduler),
     )
 
     # Training

@@ -42,6 +42,7 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from trainer import CountShape as Trainer
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -172,6 +173,19 @@ class DataTrainingArguments:
         metadata={"help": "Whether to return all the entity levels during evaluation or just the overall ones."},
     )
 
+    dynamic_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Use Dynamic Checkpoint for train speed and gpu memory"})
+    warmup_iters: Optional[int] = field(default=30, metadata={"help": "Warmup iters for Dynamic Checkpoint"})
+    memory_threshold: Optional[float] = field(default=30, metadata={"help": "Memory upper bound"})
+    static_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Static Checkpoint"})
+    max_input_size: Optional[int] = field(default=142, metadata={"help": "Max input size of the Dataset"})
+    min_input_size: Optional[int] = field(default=32, metadata={"help": "Min input size of the Dataset"})
+
+    prev_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Use checkpoint before every opti"})
+    offload: Optional[bool] = field(default=False, metadata={"help": "offload parameters"})
+    profile_memory: Optional[bool] = field(default=False, metadata={"help": "Get memory usage"})
+
+    only_input_size: Optional[bool] = field(default=False, metadata={"help": "Get input size distribution of the dataset"})
+
     def __post_init__(self):
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
@@ -197,6 +211,11 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    copy_args = ["dynamic_checkpoint", "warmup_iters", "memory_threshold", "static_checkpoint", "max_input_size", "min_input_size", "profile_memory", "only_input_size"]
+    for arg in copy_args:
+        value = getattr(data_args, arg)
+        setattr(training_args, arg, value)
 
     # Setup logging
     logging.basicConfig(
@@ -535,6 +554,9 @@ def main():
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        import json
+        print(json.dumps(trainer.input_shape))
+        print(json.dumps(trainer.memory_collect))
         metrics = train_result.metrics
         trainer.save_model()  # Saves the tokenizer too for easy upload
 

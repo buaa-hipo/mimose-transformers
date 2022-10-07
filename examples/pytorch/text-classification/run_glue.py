@@ -26,6 +26,7 @@ from typing import Optional
 import datasets
 import numpy as np
 from datasets import load_dataset, load_metric
+import torch
 
 import transformers
 from transformers import (
@@ -41,6 +42,8 @@ from transformers import (
     default_data_collator,
     set_seed,
 )
+from trainer import CountShape as Trainer
+from transformers.hook import setup_hooks
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -86,8 +89,8 @@ class DataTrainingArguments:
     dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
-    max_seq_length: int = field(
-        default=128,
+    max_seq_length: Optional[int] = field(
+        default=None,
         metadata={
             "help": "The maximum total input sequence length after tokenization. Sequences longer "
             "than this will be truncated, sequences shorter will be padded."
@@ -96,8 +99,8 @@ class DataTrainingArguments:
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached preprocessed datasets or not."}
     )
-    pad_to_max_length: bool = field(
-        default=True,
+    pad_to_max_length: Optional[bool] = field(
+        default=False,
         metadata={
             "help": "Whether to pad all samples to `max_seq_length`. "
             "If False, will pad the samples dynamically when batching to the maximum length in the batch."
@@ -131,6 +134,18 @@ class DataTrainingArguments:
         default=None, metadata={"help": "A csv or a json file containing the validation data."}
     )
     test_file: Optional[str] = field(default=None, metadata={"help": "A csv or a json file containing the test data."})
+
+    dynamic_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Use Dynamic Checkpoint for train speed and gpu memory"})
+    warmup_iters: Optional[int] = field(default=30, metadata={"help": "Warmup iters for Dynamic Checkpoint"})
+    static_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Static Checkpoint"})
+    max_input_size: Optional[int] = field(default=142, metadata={"help": "Max input size of the Dataset"})
+    min_input_size: Optional[int] = field(default=32, metadata={"help": "Min input size of the Dataset"})
+
+    prev_checkpoint: Optional[bool] = field(default=False, metadata={"help": "Use checkpoint before every opti"})
+    offload: Optional[bool] = field(default=False, metadata={"help": "offload parameters"})
+    profile_memory: Optional[bool] = field(default=False, metadata={"help": "Get memory usage"})
+
+    only_input_size: Optional[bool] = field(default=False, metadata={"help": "Get input size distribution of the dataset"})
 
     def __post_init__(self):
         if self.task_name is not None:
@@ -184,6 +199,12 @@ class ModelArguments:
             "with private models)."
         },
     )
+    use_sublinear: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use sublinear to save GPU memory."
+        },
+    )
 
 
 def main():
@@ -198,6 +219,11 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    copy_args = ["dynamic_checkpoint", "warmup_iters", "static_checkpoint", "max_input_size", "min_input_size", "profile_memory", "only_input_size"]
+    for arg in copy_args:
+        value = getattr(data_args, arg)
+        setattr(training_args, arg, value)
 
     # Setup logging
     logging.basicConfig(
@@ -353,6 +379,32 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    if model_args.use_sublinear:
+        model.bert.encoder.sublinear = True
+
+    if data_args.offload:
+        model.train()
+        setup_hooks(model)
+        # old_forward = model.bert.encoder.forward
+        # def forward(*args, **kwargs):
+        #     cast_args = []
+        #     for arg in args:
+        #         if isinstance(arg, torch.Tensor):
+        #             cast_args.append(arg.cuda())
+        #         else:
+        #             cast_args.append(arg)
+        #     cast_kwargs = {}
+        #     for k, v in kwargs.items():
+        #         if isinstance(v, torch.Tensor):
+        #             cast_kwargs[k] = v.cuda()
+        #         else:
+        #             cast_kwargs[k] = v
+        #     ret = old_forward(*cast_args, **cast_kwargs)
+        #     ret.last_hidden_state = ret.last_hidden_state.cpu()
+        #     return ret
+        # model.bert.encoder.forward = forward
+        # setup_hooks(model.bert.encoder)
+
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -401,6 +453,9 @@ def main():
     elif data_args.task_name is not None and not is_regression:
         model.config.label2id = {l: i for i, l in enumerate(label_list)}
         model.config.id2label = {id: label for label, id in config.label2id.items()}
+    
+    if data_args.max_seq_length is None:
+        data_args.max_seq_length = tokenizer.model_max_length
 
     if data_args.max_seq_length > tokenizer.model_max_length:
         logger.warning(
@@ -487,6 +542,10 @@ def main():
     else:
         data_collator = None
 
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    # optimizer = torch.optim.AdamW(model.parameters())
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
@@ -496,6 +555,7 @@ def main():
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
         data_collator=data_collator,
+        optimizers=(optimizer, scheduler),
     )
 
     # Training
